@@ -19,7 +19,7 @@
 const { ethers } = require("ethers");
 const crypto = require("crypto");
 
-const PRIVATE_KEY = process.env.PRIVATE_KEY;
+const PRIVATE_KEY = (process.env.PRIVATE_KEY || "").trim();
 const RPC_URL  = process.env.RPC_URL;
 const NFT_API  = process.env.NFT_API;
 const VAULT    = process.env.VAULT    || "0x4FC1FF668f42e1b9Bb31AC70Ce969648b79C9988";
