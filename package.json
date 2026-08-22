@@ -1,0 +1,13 @@
+{
+  "name": "ninjanex-keeper",
+  "version": "1.0.0",
+  "private": true,
+  "description": "NinjaNex vault keeper: feeds floor price and executes payouts",
+  "main": "keeper.js",
+  "scripts": {
+    "start": "node keeper.js"
+  },
+  "dependencies": {
+    "ethers": "6.9.0"
+  }
+}
