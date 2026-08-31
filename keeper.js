@@ -1,120 +1,133 @@
 /**
- * NinjaNex Keeper — runs every 10 minutes via GitHub Actions
- * 1. Reads the live floor price of the target collection (OpenSea data on Ethereum mainnet)
- * 2. Calls updateFloorPrice when on-chain price drifts > 0.5%
- * 3. Calls executePayout when the pool reaches the floor price; the winner is paid in ETH instantly
+ * NinjaNex keeper — feeds the BAYC floor price on-chain and executes draws.
  *
- * First payout rule (V4):
- *   When the pool first reaches the floor price, the first executePayout call only records
- *   poolFullSince without paying out; after FIRST_PAYOUT_DELAY (2h) the next call executes:
- *   winner receives the floor price, all remainder goes to the creator. Normal logic after that.
+ * Setup:
+ *   1) npm install ethers
+ *   2) export KEEPER_PRIVATE_KEY=0x...   (the keeper wallet: 0x4ac21aff93f2728c4c27bd2c756816bc761da0ea)
+ *   3) node keeper.js
  *
- * Environment variables (GitHub Secrets):
- *   PRIVATE_KEY  - keeper wallet private key (gas only, no funds)
- *   RPC_URL      - Robinhood chain RPC
- *   NFT_API      - Alchemy Ethereum NFT API (reads target collection floor price)
- *   VAULT        - NinjaNexVault proxy contract address
- *   TARGET       - price reference collection (Bored Ape Yacht Club)
+ * What it does every INTERVAL_SEC seconds:
+ *   - reads the live BAYC floor (CoinGecko, keyless) and calls updateFloorPrice()
+ *     when it moved more than MIN_CHANGE_PCT (skipped if the move looks like bad data)
+ *   - when the prize pool covers the floor, calls executePayout() — the contract
+ *     enforces the 2h first-draw delay itself, so calling early is harmless
  */
 const { ethers } = require("ethers");
-const crypto = require("crypto");
 
-const PRIVATE_KEY = (process.env.PRIVATE_KEY || "").trim();
-const RPC_URL  = process.env.RPC_URL;
-const NFT_API  = process.env.NFT_API;
-const VAULT    = process.env.VAULT    || "0x4FC1FF668f42e1b9Bb31AC70Ce969648b79C9988";
-const TARGET   = process.env.TARGET   || "0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D";
-
-const FIRST_PAYOUT_DELAY = 2 * 3600; // must match contract FIRST_PAYOUT_DELAY
+const CONFIG = {
+  rpc: "https://rpc.mainnet.chain.robinhood.com",
+  contract: "0x4FC1FF668f42e1b9Bb31AC70Ce969648b79C9988",
+  chainId: 4663,
+  intervalSec: 300,          // check every 5 minutes
+  minChangePct: 0.5,         // only push a new floor if it moved >= 0.5%
+  maxJumpPct: 50,            // ignore API readings more than 50% away from on-chain (bad-data guard)
+  blurApi: "https://core-api.prod.blur.io/v1/collections/0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d", // keyless, high precision
+  coingeckoApi: "https://api.coingecko.com/api/v3/nfts/bored-ape-yacht-club", // keyless, coarse (2-3 decimals)
+};
 
 const ABI = [
+  "function keeper() view returns (address)",
   "function floorPrice() view returns (uint256)",
   "function prizePool() view returns (uint256)",
+  "function totalStaked() view returns (uint256)",
   "function shouldFill() view returns (bool)",
   "function firstPayoutDone() view returns (bool)",
   "function poolFullSince() view returns (uint256)",
+  "function paused() view returns (bool)",
   "function updateFloorPrice(uint256 newPrice) external",
-  "function executePayout(uint256 randomSeed) external"
+  "function executePayout(uint256 randomSeed) external",
 ];
 
+const log = (...a) => console.log(new Date().toISOString(), ...a);
+
+// source chain: Blur (keyless, ~10 decimals) -> CoinGecko (keyless, coarse fallback)
 async function fetchFloorEth() {
-  const res = await fetch(`${NFT_API}/getFloorPrice?contractAddress=${TARGET}`);
-  const j = await res.json();
-  const p = j && j.openSea && j.openSea.floorPrice;
-  if (!p || !(p > 0)) throw new Error("floor price unavailable");
-  return p;
-}
-
-function randomSeed() {
-  return BigInt("0x" + crypto.randomBytes(32).toString("hex"));
-}
-
-async function tryPayout(vault) {
-  for (let i = 0; i < 5; i++) {
-    try {
-      const tx = await vault.executePayout(randomSeed());
-      await tx.wait();
-      console.log(`PAYOUT EXECUTED (tx ${tx.hash})`);
-      return true;
-    } catch (e) {
-      const msg = e.shortMessage || e.message || "";
-      console.log(`payout attempt ${i + 1} failed: ${msg}`);
-      if (msg.includes("WAIT")) return false;
-    }
+  try {
+    const res = await fetch(CONFIG.blurApi, { headers: { "User-Agent": "Mozilla/5.0" } });
+    if (!res.ok) throw new Error("blur HTTP " + res.status);
+    const j = await res.json();
+    const v = Number(j && j.collection && j.collection.floorPrice && j.collection.floorPrice.amount);
+    if (v && isFinite(v) && v > 0) return v;
+    throw new Error("blur returned no floor");
+  } catch (e) {
+    log("blur feed failed (" + e.message + ") — falling back to coingecko");
   }
-  console.log("payout failed after 5 attempts, will retry next run");
-  return false;
+  const res = await fetch(CONFIG.coingeckoApi, { headers: { "User-Agent": "Mozilla/5.0" } });
+  if (!res.ok) throw new Error("coingecko HTTP " + res.status);
+  const j = await res.json();
+  const v = Number(j && j.floor_price && j.floor_price.native_currency);
+  if (!v || !isFinite(v) || v <= 0) throw new Error("coingecko returned no price");
+  return v;
+}
+
+async function tick(contract, wallet) {
+  if (await contract.paused()) { log("contract paused — skipping"); return; }
+
+  // 1) floor price feed
+  try {
+    const live = await fetchFloorEth();
+    const onchain = await contract.floorPrice();
+    const onchainEth = Number(ethers.formatEther(onchain));
+    const diffPct = onchainEth > 0 ? Math.abs(live - onchainEth) / onchainEth * 100 : 100;
+    if (diffPct >= CONFIG.minChangePct) {
+      if (diffPct > CONFIG.maxJumpPct) {
+        log(`floor jump ${onchainEth} -> ${live} ETH (${diffPct.toFixed(1)}%) exceeds guard — skipped`);
+      } else {
+        const wei = ethers.parseEther(live.toFixed(6));
+        const tx = await contract.updateFloorPrice(wei);
+        log(`updateFloorPrice ${onchainEth} -> ${live} ETH, tx ${tx.hash}`);
+        await tx.wait();
+        log("floor confirmed on-chain");
+      }
+    } else {
+      log(`floor ok: on-chain ${onchainEth} ETH vs live ${live} ETH (${diffPct.toFixed(2)}%)`);
+    }
+  } catch (e) {
+    log("floor feed failed:", e.shortMessage || e.message);
+  }
+
+  // 2) draw execution
+  try {
+    const [fill, staked, firstDone, fullSince] = await Promise.all([
+      contract.shouldFill(), contract.totalStaked(), contract.firstPayoutDone(), contract.poolFullSince(),
+    ]);
+    if (!fill || staked === 0n) return;
+    if (!firstDone && fullSince === 0n) {
+      // first call only arms the 2h countdown (contract returns without drawing)
+      const tx = await contract.executePayout(ethers.toBigInt(ethers.randomBytes(32)));
+      log("pool full — armed first-draw countdown, tx", tx.hash);
+      await tx.wait();
+      return;
+    }
+    const tx = await contract.executePayout(ethers.toBigInt(ethers.randomBytes(32)));
+    log("executePayout sent, tx", tx.hash);
+    const rc = await tx.wait();
+    log(rc.status === 1 ? "DRAW EXECUTED" : "draw tx reverted");
+  } catch (e) {
+    const m = e.shortMessage || e.message || "";
+    if (m.includes("WAIT")) log("first draw: 2h delay still running");
+    else log("payout attempt failed:", m);
+  }
 }
 
 async function main() {
-  if (!PRIVATE_KEY) throw new Error("PRIVATE_KEY missing");
-  if (!RPC_URL) throw new Error("RPC_URL missing (set as GitHub Actions secret)");
-  if (!NFT_API) throw new Error("NFT_API missing (set as GitHub Actions secret)");
-  const provider = new ethers.JsonRpcProvider(RPC_URL);
-  const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
-  const vault = new ethers.Contract(VAULT, ABI, wallet);
+  const key = (process.env.KEEPER_PRIVATE_KEY || process.env.PRIVATE_KEY || "").trim();
+  if (!key) { console.error("set KEEPER_PRIVATE_KEY (or PRIVATE_KEY) in repo secrets first"); process.exit(1); }
+  const provider = new ethers.JsonRpcProvider(CONFIG.rpc, CONFIG.chainId, { staticNetwork: true });
+  const wallet = new ethers.Wallet(key, provider);
+  const contract = new ethers.Contract(CONFIG.contract, ABI, wallet);
 
-  const floorEth = await fetchFloorEth();
-  const newFloor = ethers.parseEther(floorEth.toFixed(6));
-  const [onchainFloor, pool, fill, firstDone, fullSince] = await Promise.all([
-    vault.floorPrice(), vault.prizePool(), vault.shouldFill(),
-    vault.firstPayoutDone(), vault.poolFullSince()
-  ]);
-  console.log(`live floor: ${floorEth} ETH | on-chain: ${ethers.formatEther(onchainFloor)} | pool: ${ethers.formatEther(pool)} | shouldFill: ${fill} | firstPayoutDone: ${firstDone}`);
-
-  // only feed the price when drift > 0.5%, saves gas
-  const drift = onchainFloor === 0n ? 100 : Math.abs(Number(newFloor - onchainFloor) / Number(onchainFloor)) * 100;
-  if (drift > 0.5 || (fill && onchainFloor !== newFloor)) {
-    const tx = await vault.updateFloorPrice(newFloor);
-    await tx.wait();
-    console.log(`floor updated -> ${floorEth} ETH (tx ${tx.hash})`);
-  } else {
-    console.log(`drift ${drift.toFixed(2)}% <= 0.5%, skip update`);
+  const keeper = await contract.keeper();
+  if (keeper.toLowerCase() !== wallet.address.toLowerCase()) {
+    console.error(`this key is ${wallet.address} but the contract keeper is ${keeper} — updateFloorPrice/executePayout would revert`);
+    process.exit(1);
   }
+  log(`keeper ${wallet.address} | balance ${ethers.formatEther(await provider.getBalance(wallet.address))} ETH`);
 
-  if (!(await vault.shouldFill())) return;
-
-  // ===== first payout: two phases =====
-  if (!firstDone) {
-    if (fullSince === 0n) {
-      const tx = await vault.executePayout(randomSeed());
-      await tx.wait();
-      console.log(`pool full — first payout marked at ${new Date().toISOString()}, pays out after 2h (tx ${tx.hash})`);
-      return;
-    }
-    const unlockAt = Number(fullSince) + FIRST_PAYOUT_DELAY;
-    const now = Math.floor(Date.now() / 1000);
-    if (now < unlockAt) {
-      console.log(`first payout pending — ${Math.ceil((unlockAt - now) / 60)} min remaining`);
-      return;
-    }
-    console.log("first payout delay elapsed — executing FIRST payout (winner gets floor, remainder to creator)");
-    await tryPayout(vault);
-    return;
-  }
-
-  // ===== regular payout =====
-  await tryPayout(vault);
+  const loop = async () => { try { await tick(contract, wallet); } catch (e) { log("tick error:", e.message); } };
+  await loop();
+  if (process.env.GITHUB_ACTIONS) return; // Actions runs one tick per scheduled invocation
+  setInterval(loop, CONFIG.intervalSec * 1000);
 }
 
-main().catch(e => { console.error(e); process.exit(1); });
+main();
