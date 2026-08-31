@@ -7,7 +7,7 @@
  *   3) node keeper.js
  *
  * What it does every INTERVAL_SEC seconds:
- *   - reads the live BAYC floor (CoinGecko, keyless) and calls updateFloorPrice()
+ *   - reads the live BAYC floor (Reservoir / CoinGecko / Blur fallback) and calls updateFloorPrice()
  *     when it moved more than MIN_CHANGE_PCT (skipped if the move looks like bad data)
  *   - when the prize pool covers the floor, calls executePayout() — the contract
  *     enforces the 2h first-draw delay itself, so calling early is harmless
@@ -21,8 +21,6 @@ const CONFIG = {
   intervalSec: 300,          // check every 5 minutes
   minChangePct: 0.5,         // only push a new floor if it moved >= 0.5%
   maxJumpPct: 50,            // ignore API readings more than 50% away from on-chain (bad-data guard)
-  blurApi: "https://core-api.prod.blur.io/v1/collections/0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d", // keyless, high precision
-  coingeckoApi: "https://api.coingecko.com/api/v3/nfts/bored-ape-yacht-club", // keyless, coarse (2-3 decimals)
 };
 
 const ABI = [
@@ -40,25 +38,67 @@ const ABI = [
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
-// source chain: Blur (keyless, ~10 decimals) -> CoinGecko (keyless, coarse fallback)
-async function fetchFloorEth() {
+// ---- network helpers ----
+
+async function fetchWithTimeout(url, opts = {}, ms = 5000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
   try {
-    const res = await fetch(CONFIG.blurApi, { headers: { "User-Agent": "Mozilla/5.0" } });
-    if (!res.ok) throw new Error("blur HTTP " + res.status);
-    const j = await res.json();
-    const v = Number(j && j.collection && j.collection.floorPrice && j.collection.floorPrice.amount);
-    if (v && isFinite(v) && v > 0) return v;
+    const res = await fetch(url, { ...opts, signal: ctrl.signal });
+    clearTimeout(t);
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return res.json();
+  } catch (e) {
+    clearTimeout(t);
+    throw e;
+  }
+}
+
+// source chain: Reservoir (keyless, stable) -> CoinGecko (keyless, coarse) -> Blur (keyless)
+async function fetchFloorEth() {
+  // 1) Reservoir
+  try {
+    const j = await fetchWithTimeout(
+      "https://api.reservoir.tools/collections/v6?id=0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d",
+      { headers: { "User-Agent": "Mozilla/5.0" } }, 5000
+    );
+    const v = Number(j?.collections?.[0]?.floorAsk?.price?.amount?.decimal);
+    if (v > 0 && isFinite(v)) return v;
+    throw new Error("reservoir returned no floor");
+  } catch (e) {
+    log("reservoir feed failed (" + e.message + ") — falling back to coingecko");
+  }
+
+  // 2) CoinGecko
+  try {
+    const j = await fetchWithTimeout(
+      "https://api.coingecko.com/api/v3/nfts/bored-ape-yacht-club",
+      { headers: { "User-Agent": "Mozilla/5.0" } }, 5000
+    );
+    const v = Number(j?.floor_price?.native_currency);
+    if (v > 0 && isFinite(v)) return v;
+    throw new Error("coingecko returned no price");
+  } catch (e) {
+    log("coingecko feed failed (" + e.message + ") — falling back to blur");
+  }
+
+  // 3) Blur
+  try {
+    const j = await fetchWithTimeout(
+      "https://core-api.prod.blur.io/v1/collections/0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d",
+      { headers: { "User-Agent": "Mozilla/5.0" } }, 5000
+    );
+    const v = Number(j?.collection?.floorPrice?.amount);
+    if (v > 0 && isFinite(v)) return v;
     throw new Error("blur returned no floor");
   } catch (e) {
-    log("blur feed failed (" + e.message + ") — falling back to coingecko");
+    log("blur feed failed (" + e.message + ")");
   }
-  const res = await fetch(CONFIG.coingeckoApi, { headers: { "User-Agent": "Mozilla/5.0" } });
-  if (!res.ok) throw new Error("coingecko HTTP " + res.status);
-  const j = await res.json();
-  const v = Number(j && j.floor_price && j.floor_price.native_currency);
-  if (!v || !isFinite(v) || v <= 0) throw new Error("coingecko returned no price");
-  return v;
+
+  throw new Error("all floor price sources failed");
 }
+
+// ---- main loop ----
 
 async function tick(contract, wallet) {
   if (await contract.paused()) { log("contract paused — skipping"); return; }
