@@ -1,4 +1,4 @@
-/**
+**
  * NinjaNex keeper — feeds the QUOTRONS floor price on-chain and executes draws.
  *
  * Setup:
@@ -48,14 +48,21 @@ async function fetchFloorEth() {
     try {
       const res = await fetch("https://api.opensea.io/api/v2/collections/quotrons404/stats",
         { headers: { "X-API-KEY": osKey, "User-Agent": "Mozilla/5.0" } });
-      if (!res.ok) throw new Error("opensea HTTP " + res.status);
-      const j = await res.json();
-      const v = Number(j && j.total && j.total.floor_price);
-      if (v && isFinite(v) && v > 0) return v;
-      throw new Error("opensea returned no floor");
+      const body = await res.text();
+      if (!res.ok) throw new Error("opensea HTTP " + res.status + " | " + body.slice(0, 120));
+      const j = JSON.parse(body);
+      const t = (j && j.total) || {};
+      const v = Number(t.floor_price);
+      log("opensea stats: floor_price=" + t.floor_price + " symbol=" + t.floor_price_symbol);
+      if (!v || !isFinite(v) || v <= 0) throw new Error("no floor in body | " + body.slice(0, 120));
+      if (t.floor_price_symbol && t.floor_price_symbol !== "ETH" && t.floor_price_symbol !== "WETH")
+        throw new Error("floor symbol is " + t.floor_price_symbol + " (not ETH)");
+      return v;
     } catch (e) {
       log("opensea feed failed (" + e.message + ") — falling back to dexscreener pool price");
     }
+  } else {
+    log("no OPENSEA_API_KEY — using dexscreener pool price");
   }
   // 2) DexScreener QUOTRON/WETH pool price — keyless fallback
   const res = await fetch(CONFIG.dexscreenerApi, { headers: { "User-Agent": "Mozilla/5.0" } });
@@ -66,6 +73,7 @@ async function fetchFloorEth() {
     p.chainId === "robinhood" && p.quoteToken && p.quoteToken.symbol === "WETH" && Number(p.priceNative) > 0);
   pairs.sort((a, b) => ((b.liquidity && b.liquidity.usd) || 0) - ((a.liquidity && a.liquidity.usd) || 0));
   if (!pairs.length) throw new Error("dexscreener returned no WETH pair");
+  log("dexscreener pool: " + pairs[0].priceNative + " WETH (" + pairs[0].dexId + ")");
   return Number(pairs[0].priceNative);
 }
 
