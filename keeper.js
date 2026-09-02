@@ -1,5 +1,5 @@
 /**
- * NinjaNex keeper — feeds the BAYC floor price on-chain and executes draws.
+ * NinjaNex keeper — feeds the QUOTRONS floor price on-chain and executes draws.
  *
  * Setup:
  *   1) npm install ethers
@@ -7,7 +7,7 @@
  *   3) node keeper.js
  *
  * What it does every INTERVAL_SEC seconds:
- *   - reads the live BAYC floor (Reservoir / CoinGecko / Blur fallback) and calls updateFloorPrice()
+ *   - reads the live QUOTRON/WETH price (DexScreener, keyless) and calls updateFloorPrice()
  *     when it moved more than MIN_CHANGE_PCT (skipped if the move looks like bad data)
  *   - when the prize pool covers the floor, calls executePayout() — the contract
  *     enforces the 2h first-draw delay itself, so calling early is harmless
@@ -21,6 +21,8 @@ const CONFIG = {
   intervalSec: 300,          // check every 5 minutes
   minChangePct: 0.5,         // only push a new floor if it moved >= 0.5%
   maxJumpPct: 50,            // ignore API readings more than 50% away from on-chain (bad-data guard)
+  // QUOTRONS: 1 liquid $QUOTRON token = 1 machine (NFT) — token price in WETH IS the floor
+  dexscreenerApi: "https://api.dexscreener.com/latest/dex/tokens/0x5a86828Efd322bfb16d93cFeD16EE9BC14940D7F", // keyless
 };
 
 const ABI = [
@@ -38,74 +40,42 @@ const ABI = [
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
-// ---- network helpers ----
-
-async function fetchWithTimeout(url, opts = {}, ms = 5000) {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), ms);
-  try {
-    const res = await fetch(url, { ...opts, signal: ctrl.signal });
-    clearTimeout(t);
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    return res.json();
-  } catch (e) {
-    clearTimeout(t);
-    throw e;
-  }
-}
-
-// source chain: Reservoir (keyless, stable) -> CoinGecko (keyless, coarse) -> Blur (keyless)
+// source: DexScreener canonical QUOTRON/WETH pool (keyless, live)
 async function fetchFloorEth() {
-  // 1) Reservoir
-  try {
-    const j = await fetchWithTimeout(
-      "https://api.reservoir.tools/collections/v6?id=0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d",
-      { headers: { "User-Agent": "Mozilla/5.0" } }, 5000
-    );
-    const v = Number(j?.collections?.[0]?.floorAsk?.price?.amount?.decimal);
-    if (v > 0 && isFinite(v)) return v;
-    throw new Error("reservoir returned no floor");
-  } catch (e) {
-    log("reservoir feed failed (" + e.message + ") — falling back to coingecko");
+  // 1) OpenSea listing floor — the number users see on the marketplace (free key: OPENSEA_API_KEY env)
+  const osKey = (process.env.OPENSEA_API_KEY || "3281328017194170a56c2fa3833c1eaf").trim();
+  if (osKey) {
+    try {
+      const res = await fetch("https://api.opensea.io/api/v2/collections/quotrons404/stats",
+        { headers: { "X-API-KEY": osKey, "User-Agent": "Mozilla/5.0" } });
+      if (!res.ok) throw new Error("opensea HTTP " + res.status);
+      const j = await res.json();
+      const v = Number(j && j.total && j.total.floor_price);
+      if (v && isFinite(v) && v > 0) return v;
+      throw new Error("opensea returned no floor");
+    } catch (e) {
+      log("opensea feed failed (" + e.message + ") — falling back to dexscreener pool price");
+    }
   }
-
-  // 2) CoinGecko
-  try {
-    const j = await fetchWithTimeout(
-      "https://api.coingecko.com/api/v3/nfts/bored-ape-yacht-club",
-      { headers: { "User-Agent": "Mozilla/5.0" } }, 5000
-    );
-    const v = Number(j?.floor_price?.native_currency);
-    if (v > 0 && isFinite(v)) return v;
-    throw new Error("coingecko returned no price");
-  } catch (e) {
-    log("coingecko feed failed (" + e.message + ") — falling back to blur");
-  }
-
-  // 3) Blur
-  try {
-    const j = await fetchWithTimeout(
-      "https://core-api.prod.blur.io/v1/collections/0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d",
-      { headers: { "User-Agent": "Mozilla/5.0" } }, 5000
-    );
-    const v = Number(j?.collection?.floorPrice?.amount);
-    if (v > 0 && isFinite(v)) return v;
-    throw new Error("blur returned no floor");
-  } catch (e) {
-    log("blur feed failed (" + e.message + ")");
-  }
-
-  throw new Error("all floor price sources failed");
+  // 2) DexScreener QUOTRON/WETH pool price — keyless fallback
+  const res = await fetch(CONFIG.dexscreenerApi, { headers: { "User-Agent": "Mozilla/5.0" } });
+  if (!res.ok) throw new Error("dexscreener HTTP " + res.status);
+  const j = await res.json();
+  // canonical QUOTRON/WETH market on Robinhood Chain, deepest liquidity wins
+  const pairs = ((j && j.pairs) || []).filter(p =>
+    p.chainId === "robinhood" && p.quoteToken && p.quoteToken.symbol === "WETH" && Number(p.priceNative) > 0);
+  pairs.sort((a, b) => ((b.liquidity && b.liquidity.usd) || 0) - ((a.liquidity && a.liquidity.usd) || 0));
+  if (!pairs.length) throw new Error("dexscreener returned no WETH pair");
+  return Number(pairs[0].priceNative);
 }
-
-// ---- main loop ----
 
 async function tick(contract, wallet) {
   if (await contract.paused()) { log("contract paused — skipping"); return; }
 
   // 1) floor price feed
   try {
-    const live = await fetchFloorEth();
+    let live = await fetchFloorEth();
+    if (process.env.FORCE_FLOOR_ETH) { live = Number(process.env.FORCE_FLOOR_ETH); log("FORCE_FLOOR_ETH override: " + live); }
     const onchain = await contract.floorPrice();
     const onchainEth = Number(ethers.formatEther(onchain));
     const diffPct = onchainEth > 0 ? Math.abs(live - onchainEth) / onchainEth * 100 : 100;
